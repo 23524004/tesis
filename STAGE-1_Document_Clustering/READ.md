@@ -17,7 +17,7 @@ SBERT => UMAP => HDBSCAN
 ### pipeline2.py
 terdapat gridsearch hyperparameter tuning didalamnya
 ### pipeline2_noGrid.py
-langsung set hyperarameter sendiri, jika tidak pakai nilai default
+langsung set hyperarameter sendiri, jika kosong akan pakai nilai default
 
 
 ## License
