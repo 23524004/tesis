@@ -2,10 +2,11 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 from collections import defaultdict
-from typing import List, Dict, Optional
-
-import yake
+from typing import List, Dict, Optional, Set
 import re
+import yake
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+import matplotlib.pyplot as plt
 
 
 class TopicLabeler:
@@ -19,21 +20,30 @@ class TopicLabeler:
         language: str = "en",
         top_n_keywords: int = 10,
         min_docs_per_cluster: int = 5,
+        use_stopwords: bool = True,
+        custom_stopwords: Optional[Set[str]] = None,
         yake_params: Optional[Dict] = None,
         textrank_params: Optional[Dict] = None,
-        score_combination: str = "weighted",  # {"yake", "textrank", "weighted"}
+        score_combination: str = "weighted",
         alpha: float = 0.5,
         verbose: bool = True,
-        # random_state: int = 42,
+        text_weights: Optional[Dict[str, int]] = None,
+        random_state: int = 42,
     ):
         self.text_columns = text_columns
         self.language = language
         self.top_n_keywords = top_n_keywords
         self.min_docs_per_cluster = min_docs_per_cluster
+        self.use_stopwords = use_stopwords
+        self.custom_stopwords = custom_stopwords or set()
         self.score_combination = score_combination
         self.alpha = alpha
         self.verbose = verbose
-        # self.random_state = random_state
+        self.text_weights = text_weights or {
+            col: 1 for col in self.text_columns 
+        }
+        self._graphs = {}
+        self.random_state = random_state
 
         self.yake_params = yake_params or {
             "n": 3,
@@ -46,10 +56,16 @@ class TopicLabeler:
             "window_size": 5
         }
 
+        # Build stopword set
+        if self.use_stopwords:
+            self.stopwords = set(ENGLISH_STOP_WORDS) | self.custom_stopwords
+        else:
+            self.stopwords = set()
+
         self._topic_info = []
         self._keyword_table = []
 
-        # np.random.seed(self.random_state)
+        np.random.seed(self.random_state)
 
     # ------------------------------------------------------------------
     # Public API
@@ -82,34 +98,38 @@ class TopicLabeler:
             keyword_df = result["keyword_scores"]
             keyword_df["topic_id"] = cluster_id
             self._keyword_table.append(keyword_df)
+            self._graphs[cluster_id] = result["graph"]
 
         return self
 
     def label_cluster(self, cluster_df: pd.DataFrame) -> Dict:
         texts = self._prepare_cluster_text(cluster_df)
-
+    
         yake_scores = self._extract_yake_candidates(texts)
         if not yake_scores:
             return {
                 "topic_label": "",
                 "keywords": [],
-                "keyword_scores": pd.DataFrame()
+                "keyword_scores": pd.DataFrame(),
+                "graph": nx.Graph()
             }
-
+    
         graph = self._build_textrank_graph(texts, list(yake_scores.keys()))
         textrank_scores = self._run_textrank(graph)
-
+    
         keyword_df = self._combine_scores(yake_scores, textrank_scores)
         keyword_df = keyword_df.sort_values("final_score", ascending=False)
-
+    
         top_keywords = keyword_df.head(self.top_n_keywords)["keyword"].tolist()
         topic_label = top_keywords[0] if top_keywords else ""
-
+    
         return {
             "topic_label": topic_label,
             "keywords": top_keywords,
             "keyword_scores": keyword_df.reset_index(drop=True),
+            "graph": graph
         }
+
 
     def get_topic_info(self) -> pd.DataFrame:
         return pd.DataFrame(self._topic_info)
@@ -129,6 +149,81 @@ class TopicLabeler:
         df["topic_label"] = df["cluster"].map(topic_map)
         return df
 
+    def get_textrank_graph(self, cluster_id: int) -> nx.Graph:
+        """
+        Return TextRank graph for a given cluster.
+        """
+        return self._graphs.get(cluster_id, None)
+
+    def visualize_textrank_graph(
+        self,
+        cluster_id: int,
+        min_degree: int = 1,
+        figsize=(10, 8),
+        layout: str = "spring"
+    ):
+        """
+        Visualize TextRank graph of a cluster.
+        
+        Parameters
+        ----------
+        cluster_id : int
+            Cluster ID to visualize.
+        min_degree : int
+            Filter nodes with degree < min_degree.
+        layout : {"spring", "kamada_kawai", "circular"}
+            Graph layout.
+        """
+    
+        graph = self.get_textrank_graph(cluster_id)
+    
+        if graph is None or graph.number_of_nodes() == 0:
+            print("Graph not found or empty.")
+            return
+    
+        # Filter by degree
+        nodes_to_keep = [
+            n for n, d in graph.degree()
+            if d >= min_degree
+        ]
+    
+        subgraph = graph.subgraph(nodes_to_keep)
+    
+        print("Nodes:", subgraph.number_of_nodes())
+        print("Edges:", subgraph.number_of_edges())
+        print("Density:", nx.density(subgraph))
+    
+        if layout == "spring":
+            pos = nx.spring_layout(subgraph, seed=self.random_state)
+        elif layout == "kamada_kawai":
+            pos = nx.kamada_kawai_layout(subgraph)
+        else:
+            pos = nx.circular_layout(subgraph)
+    
+        plt.figure(figsize=figsize)
+        nx.draw_networkx_nodes(subgraph, pos, node_size=300)
+        nx.draw_networkx_edges(subgraph, pos, alpha=0.3)
+        nx.draw_networkx_labels(subgraph, pos, font_size=8)
+    
+        plt.title(f"TextRank Graph - Cluster {cluster_id}")
+        plt.axis("off")
+        plt.show()
+
+    def get_graph_statistics(self, cluster_id: int) -> Dict:
+        graph = self.get_textrank_graph(cluster_id)
+    
+        if graph is None:
+            return {}
+    
+        return {
+            "nodes": graph.number_of_nodes(),
+            "edges": graph.number_of_edges(),
+            "density": nx.density(graph),
+            "average_degree": np.mean([d for _, d in graph.degree()]),
+            "connected_components": nx.number_connected_components(graph)
+        }
+
+
     # ------------------------------------------------------------------
     # Internal Helpers
     # ------------------------------------------------------------------
@@ -141,19 +236,30 @@ class TopicLabeler:
 
     def _prepare_cluster_text(self, cluster_df: pd.DataFrame) -> List[str]:
         texts = []
+    
         for _, row in cluster_df.iterrows():
             parts = []
+    
             for col in self.text_columns:
                 if pd.notna(row[col]):
-                    parts.append(str(row[col]))
+                    weight = self.text_weights.get(col, 1)
+    
+                    # repeat text based on weight
+                    for _ in range(weight):
+                        parts.append(str(row[col]))
+    
             text = ". ".join(parts).strip()
+    
             if text:
                 texts.append(text)
+    
         return texts
+
 
     def _extract_yake_candidates(self, texts: List[str]) -> Dict[str, float]:
         kw_extractor = yake.KeywordExtractor(
             lan=self.language,
+            stopwords=self.stopwords if self.use_stopwords else None,
             **self.yake_params
         )
 
@@ -171,13 +277,15 @@ class TopicLabeler:
         texts: List[str],
         candidates: List[str]
     ) -> nx.Graph:
+
         window_size = self.textrank_params.get("window_size", 5)
         graph = nx.Graph()
 
         candidate_set = set(candidates)
-        tokenized_docs = [self._simple_tokenize(t) for t in texts]
 
-        for tokens in tokenized_docs:
+        for text in texts:
+            tokens = self._simple_tokenize(text)
+
             for i, token in enumerate(tokens):
                 if token not in candidate_set:
                     continue
@@ -193,28 +301,30 @@ class TopicLabeler:
     def _run_textrank(self, graph: nx.Graph) -> Dict[str, float]:
         if graph.number_of_nodes() == 0:
             return {}
-        scores = nx.pagerank(graph, weight="weight")
-        return scores
+        return nx.pagerank(graph, weight="weight")
 
     def _combine_scores(
         self,
         yake_scores: Dict[str, float],
         textrank_scores: Dict[str, float]
     ) -> pd.DataFrame:
+
         keywords = set(yake_scores) | set(textrank_scores)
 
         rows = []
         for kw in keywords:
-            y = yake_scores.get(kw, np.nan)
-            t = textrank_scores.get(kw, 0.0)
-            rows.append((kw, y, t))
+            rows.append((
+                kw,
+                yake_scores.get(kw, np.nan),
+                textrank_scores.get(kw, 0.0)
+            ))
 
         df = pd.DataFrame(
             rows,
             columns=["keyword", "yake_score", "textrank_score"]
         )
 
-        # Normalize
+        # Normalize YAKE (lower is better → invert)
         if df["yake_score"].notna().any():
             df["yake_norm"] = 1 - (
                 (df["yake_score"] - df["yake_score"].min()) /
@@ -223,6 +333,7 @@ class TopicLabeler:
         else:
             df["yake_norm"] = 0.0
 
+        # Normalize TextRank
         if df["textrank_score"].max() > 0:
             df["textrank_norm"] = (
                 df["textrank_score"] / df["textrank_score"].max()
@@ -242,8 +353,17 @@ class TopicLabeler:
 
         return df.sort_values("final_score", ascending=False)
 
-    @staticmethod
-    def _simple_tokenize(text: str) -> List[str]:
+    def _simple_tokenize(self, text: str) -> List[str]:
         text = text.lower()
         text = re.sub(r"[^a-z0-9\s]", " ", text)
-        return [t for t in text.split() if len(t) > 2]
+        tokens = text.split()
+
+        if self.use_stopwords:
+            tokens = [
+                t for t in tokens
+                if t not in self.stopwords and len(t) > 2
+            ]
+        else:
+            tokens = [t for t in tokens if len(t) > 2]
+
+        return tokens
